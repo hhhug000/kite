@@ -198,7 +198,7 @@ def run_username_checks(username, sites, max_workers=20, quick=False, http_get_f
 
     def _worker(site):
         name, pretty, found, status = check_site(site, username, http_get_fn=http_get_fn)
-        return {"site": name, "username": username, "url": pretty, "exists": found, "status_code": status}
+        return {"site": name, "username": username, "url": pretty, "exists": found, "status_code": status, "category": site.get("cat")}
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_worker, s): s for s in sites}

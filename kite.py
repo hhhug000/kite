@@ -2,6 +2,7 @@
 
 import shutil
 import threading
+import re
 from typing import Dict
 from username_search import load_site_list, run_username_checks
 
@@ -58,8 +59,32 @@ def _print_connected_box(width: int, options: list[str], extra_lines: list[str] 
     inner = width - 4
     print("┌" + "─" * (width - 2) + "┐")
     logo_lines = logo_override if logo_override is not None else LOGO_LINES
+
+    # helpers to handle ANSI/OSC escape sequences so padding/truncation
+    # is based on visible width rather than raw string length.
+    _ansi_csi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+    _ansi_osc = re.compile(r"\x1b\].*?\x1b\\")
+
+    def _visible_len(s: str) -> int:
+        s2 = _ansi_osc.sub('', s)
+        s2 = _ansi_csi.sub('', s2)
+        return len(s2)
+
+    def _print_box_line(text: str) -> None:
+        vis = _visible_len(text)
+        if vis > inner:
+            # naive truncate while preserving escape sequences at the end
+            trimmed = text
+            # remove one char at a time until visible length fits
+            while _visible_len(trimmed) > inner and trimmed:
+                trimmed = trimmed[:-1]
+            print("│ " + trimmed + " │")
+        else:
+            pad = inner - vis
+            print("│ " + text + (" " * pad) + " │")
+
     for l in logo_lines:
-        print("│ " + l.ljust(inner) + " │")
+        _print_box_line(l)
     # separator between logo and title
     print("├" + "─" * (width - 2) + "┤")
     print("│ " + "Known Identity Traversal Engine".ljust(inner) + " │")
@@ -67,7 +92,7 @@ def _print_connected_box(width: int, options: list[str], extra_lines: list[str] 
     print("├" + "─" * (width - 2) + "┤")
 
     for opt in options:
-        print("│ " + opt.ljust(inner) + " │")
+        _print_box_line(opt)
 
     # optional extra section (separate area beneath options)
     if extra_lines:
@@ -79,11 +104,31 @@ def _print_connected_box(width: int, options: list[str], extra_lines: list[str] 
                 text, align = item[0], item[1]
 
             if align == "right":
-                print("│ " + text.rjust(inner) + " │")
+                # right-align based on visible length
+                vis = _visible_len(text)
+                pad = inner - vis
+                if pad > 0:
+                    print("│ " + (" " * pad) + text + " │")
+                else:
+                    # truncate if needed
+                    trimmed = text
+                    while _visible_len(trimmed) > inner and trimmed:
+                        trimmed = trimmed[:-1]
+                    print("│ " + trimmed + " │")
             elif align == "center":
-                print("│ " + text.center(inner) + " │")
+                # center based on visible width
+                vis = _visible_len(text)
+                if vis >= inner:
+                    trimmed = text
+                    while _visible_len(trimmed) > inner and trimmed:
+                        trimmed = trimmed[:-1]
+                    print("│ " + trimmed + " │")
+                else:
+                    left = (inner - vis) // 2
+                    right = inner - vis - left
+                    print("│ " + (" " * left) + text + (" " * right) + " │")
             else:
-                print("│ " + str(text).ljust(inner) + " │")
+                _print_box_line(str(text))
 
     print("└" + "─" * (width - 2) + "┘")
 
@@ -174,7 +219,7 @@ def main() -> None:
             try:
                 # load local site definitions and run username checks with progress events
                 sites = load_site_list("wnm-example.json")
-                run_username_checks(username, sites, max_workers=20, quick=False, progress_callback=progress_cb)
+                results = run_username_checks(username, sites, max_workers=20, quick=False, progress_callback=progress_cb)
             except RuntimeError as e:
                 extra = [f"Username: {username}", f"Error: {e}"]
                 # overwrite box with error
@@ -183,10 +228,29 @@ def main() -> None:
                 input("\nPress Enter to continue...")
                 continue
 
-            # search completed: render final box showing only found sites
+            # search completed: render final box showing found sites grouped by category
             final_lines: list[str]
-            if found:
-                final_lines = [f"Username: {username}", "Found:"] + [f"- {s}" for s in found]
+            # prefer authoritative results from the worker output rather than the
+            # incremental `found` list; group results by `category` and show clickable links
+            hits = [r for r in results if r.get("exists")]
+            if hits:
+                grouped: dict[str, list[tuple[str, str]]] = {}
+                for r in hits:
+                    cat = r.get("category") or "uncategorised"
+                    grouped.setdefault(cat, []).append((r.get("site"), r.get("url")))
+
+                lines = [f"Username: {username}", "Found:"]
+                # OSC 8 hyperlink template: ESC ] 8 ;; URL ESC \ text ESC ] 8 ;; ESC \\ 
+                for cat in sorted(grouped.keys()):
+                    lines.append(f"[{cat}]")
+                    for site, url in grouped[cat]:
+                        if url:
+                            # create terminal hyperlink when supported
+                            link = f"\x1b]8;;{url}\x1b\\{site}\x1b]8;;\x1b\\"
+                            lines.append(f"- {link}")
+                        else:
+                            lines.append(f"- {site}")
+                final_lines = lines
             else:
                 final_lines = [f"Username: {username}", "No matches found"]
 
