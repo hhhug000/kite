@@ -5,6 +5,15 @@ import threading
 import re
 from typing import Dict
 from username_search import load_site_list, run_username_checks
+from adapters import (
+    github_fetch,
+    reddit_fetch,
+    gitlab_fetch,
+    stackexchange_fetch,
+    youtube_fetch,
+    keybase_fetch,
+)
+from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
 
 LOGO_LINES = [
@@ -156,8 +165,8 @@ def main() -> None:
         # Print the connected box (logo + title + options) once and then
         # update it in-place using cursor movement so terminal history isn't flooded.
         extra_lines: list[str] = []
-        _print_connected_box(width, ["1) Search username", "2) Exit"], extra_lines=extra_lines)
-        last_height = _box_height(2, extra_lines, len(LOGO_LINES))
+        _print_connected_box(width, ["1) Search username", "2) Exit", "3) Fetch profiles"], extra_lines=extra_lines)
+        last_height = _box_height(3, extra_lines, len(LOGO_LINES))
         choice = input("Select an option (1-2): ").strip().lower()
 
 
@@ -250,6 +259,61 @@ def main() -> None:
                             lines.append(f"- {link}")
                         else:
                             lines.append(f"- {site}")
+                # After reporting hits, run any available adapters for detected sites
+                # adapter mapping: key -> function
+                adapter_map = {
+                    "github": github_fetch,
+                    "reddit": reddit_fetch,
+                    "gitlab": gitlab_fetch,
+                }
+
+                # run only adapters that correspond to detected hit sites
+                hit_site_names = [r.get("site", "").lower() for r in hits]
+                to_run = []
+                # mapping of substring -> adapter function
+                substr_map = [
+                    ("github", github_fetch),
+                    ("gitlab", gitlab_fetch),
+                    ("reddit", reddit_fetch),
+                    ("youtube", youtube_fetch),
+                    ("stack", stackexchange_fetch),
+                    ("stackoverflow", stackexchange_fetch),
+                    ("keybase", keybase_fetch),
+                ]
+
+                seen = set()
+                for s in hit_site_names:
+                    for substr, fn in substr_map:
+                        if substr in s and fn not in seen:
+                            to_run.append((substr, fn))
+                            seen.add(fn)
+
+                if to_run:
+                    # run adapters concurrently
+                    lines.append("")
+                    lines.append("Fetched profiles:")
+                    with ThreadPoolExecutor(max_workers=len(to_run)) as ex:
+                        futs = {ex.submit(fn, username): key for key, fn in to_run}
+                        for f in _as_completed(futs):
+                            key = futs[f]
+                            try:
+                                r = f.result()
+                            except Exception as e:
+                                lines.append(f"- {key}: ERROR: {e}")
+                                continue
+                            # r expected to be canonical dict from adapters.base.canonical_fields
+                            site = r.get("site") or key
+                            url = r.get("url") or r.get("data", {}).get("web_url") or r.get("data", {}).get("avatar_url")
+                            display = r.get("data", {}).get("display_name") or ""
+                            if url:
+                                link = f"\x1b]8;;{url}\x1b\\{site}\x1b]8;;\x1b\\"
+                                if display:
+                                    lines.append(f"- {link} ({display})")
+                                else:
+                                    lines.append(f"- {link}")
+                            else:
+                                lines.append(f"- {site} ({display})")
+
                 final_lines = lines
             else:
                 final_lines = [f"Username: {username}", "No matches found"]
@@ -261,6 +325,52 @@ def main() -> None:
         elif choice in ("2", "q", "exit"):
             print("Goodbye!")
             break
+        elif choice in ("3", "f", "fetch"):
+            username = input("Enter username to fetch profiles for: ").strip()
+            if not username:
+                print("No username entered.")
+                continue
+
+            # fetch profiles concurrently using adapters
+            adapters = [github_fetch, reddit_fetch, gitlab_fetch]
+            results = []
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futs = {ex.submit(adapter, username): adapter for adapter in adapters}
+                for f in _as_completed(futs):
+                    try:
+                        res = f.result()
+                    except Exception as e:
+                        adapter = futs[f]
+                        res = {"site": getattr(adapter, "__name__", "adapter"), "username": username, "error": str(e)}
+                    results.append(res)
+
+            # build final lines grouped by site (and show clickable links when available)
+            final_lines: list[str]
+            if results:
+                lines = [f"Username: {username}", "Profiles:"]
+                for r in results:
+                    site = r.get("site") or r.get("adapter")
+                    if r.get("error"):
+                        lines.append(f"- {site}: ERROR: {r.get('error')}")
+                        continue
+                    url = r.get("url") or r.get("data", {}).get("web_url") or r.get("data", {}).get("avatar_url")
+                    display = r.get("data", {}).get("display_name") or ""
+                    if url:
+                        link = f"\x1b]8;;{url}\x1b\\{site}\x1b]8;;\x1b\\"
+                        if display:
+                            lines.append(f"- {link} ({display})")
+                        else:
+                            lines.append(f"- {link}")
+                    else:
+                        lines.append(f"- {site} ({display})")
+                final_lines = lines
+            else:
+                final_lines = [f"Username: {username}", "No profiles found"]
+
+            # overwrite previous box with final results
+            print(f"\x1b[{last_height}A", end="")
+            _print_connected_box(width, ["1) Search username", "2) Exit", "3) Fetch profiles"], extra_lines=final_lines)
+            input("\nPress Enter to continue...")
         else:
             print("Invalid selection — please choose 1 or 2.")
 
